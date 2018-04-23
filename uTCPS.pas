@@ -10,6 +10,7 @@ unit uTCPS;
   TWinsock2TCPClient (c) 2015 SoftOz Pty. Ltd.     LGPLv2.1 with static linking exception
   mbedTLS            (C) 2006-2015, ARM Limited    Apache-2.0
 
+  https://restdb.io/docs/quick-start
 *)
 
 interface
@@ -25,6 +26,7 @@ type
   TTCPSDebugEvent = procedure (Sender : TObject; level : integer; s : string) of object;
   TTCPSVerifyEvent = procedure (Sender : TObject; Flags : LongWord; var Allow : boolean) of object;
   TTCPSAppReadEvent = procedure (Sender : TObject; buf : pointer; len : cardinal) of object;
+  TTCPSConnectEvent = procedure (Sender : TObject; Vers, Suite : string) of object;
 
   { TTCPSReadThread }
 
@@ -45,25 +47,36 @@ type
     ctr_drbg : mbedtls_ctr_drbg_context;
     entropy : mbedtls_entropy_context;
     pers : array [0..11] of char;
-//    FUseSSL : boolean;
+    FUseSSL : boolean;            // not yet implemented
     FOnVerify : TTCPSVerifyEvent;
     FOnDebug : TTCPSDebugEvent;
     FOnAppRead : TTCPSAppReadEvent;
+    FOnConnect : TTCPSConnectEvent;
+    FOnDisconnect : TNotifyEvent;
     HostName : string;
     ReadThread : TTCPSReadThread;
+    Seeded : boolean;
+    Initialised : boolean;
+    procedure ReadThreadTerminated (Sender : TObject);
   public
+    CipherVers : string;
+    CipherSuite : string;
+    CAFile : string;
     constructor Create;
     destructor Destroy; override;
     function Connect : boolean; override;
+    procedure TidyUp;
     function Issues (code : Longword) : TStringList;
     procedure AppWrite (buf : pointer; len : cardinal); overload;
     procedure AppWrite (s : string); overload;
-
+    procedure AppClose;
     procedure Seed;
-//    property UseSSL : boolean read FUseSSL write FUseSSL;
+    property UseSSL : boolean read FUseSSL write FUseSSL;
     property OnVerify : TTCPSVerifyEvent read FOnVerify write FOnVerify;
     property OnDebug : TTCPSDebugEvent read FOnDebug write FOnDebug;
     property OnAppRead : TTCPSAppReadEvent read FOnAppRead write FOnAppRead;
+    property OnConnect : TTCPSConnectEvent read  FOnConnect write FOnConnect;
+    property OnDisconnect : TNotifyEvent read FOnDisconnect write FOnDisconnect;
   end;
 
 implementation
@@ -126,10 +139,7 @@ begin
   if cl.ReadAvailable (buf, len, count, closed) then
     Result := count
   else if closed then
-    begin
-      Log ('Disconnected - tidy up');
-      Result := -MBEDTLS_ERR_NET_CONN_RESET;
-    end
+    Result := -MBEDTLS_ERR_NET_CONN_RESET
   else
     Result := -MBEDTLS_ERR_NET_RECV_FAILED;
 end;
@@ -173,54 +183,50 @@ end;
 procedure TTCPSReadThread.Execute;
 var
   res : integer;
-  len, i : integer;
-  rxstring : string;
+  len : integer;
   rxbuf : array [0..511] of char;
 begin
-  Log ('Read Thread Started...');
+//  Log ('Read Thread Started...');
   FillChar (rxbuf, sizeof (rxbuf), 0);
   len := sizeof (rxbuf);
   while not Terminated do
     begin
       res := mbedtls_ssl_read (@Owner.ssl, @rxbuf, len);
- //     log ('read app res ' + res.ToString);
       if (res = -MBEDTLS_ERR_SSL_WANT_READ) or (res = -MBEDTLS_ERR_SSL_WANT_WRITE) then continue;
-      if res = -MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY then break; // read will terminate
+      if (res = -MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) or (res = -MBEDTLS_ERR_NET_CONN_RESET) then break; // read will terminate
       if res < 0 then  // general error
         begin
-          res := -res;
-          log ('mbedtls_ssl_read error ' + res.ToHexString (4));
+          log ('mbedtls_ssl_read error ' + ErrToStr (res));
           break; // read and socket will terminate
         end
       else
         begin
-          Log (res.ToString + ' bytes read');
-    //    i := length (rxstring);
-      //  setLength (rxstring, length (rxstring) + res);
-       // move (rxbuf[0], rxstring[i + 1], res);
           if Assigned (Owner.OnAppRead) then Owner.OnAppRead (Owner, @rxbuf[0], res);
-      end;
+        end;
     end;
-  Log ('Read Thread Terminating');
-  mbedtls_ssl_close_notify (@Owner.ssl);
+//  Log ('Read Thread Terminating');
+  Owner.TidyUp;
 end;
 
 { TTCPSClient }
 
+procedure TTCPSClient.ReadThreadTerminated (Sender: TObject);
+begin
+  Log ('Read Thread Terminated.');
+end;
+
 constructor TTCPSClient.Create;
 begin
   inherited Create;
-  mbedtls_ssl_init (@ssl);
-  mbedtls_ssl_config_init (@conf);
-  mbedtls_x509_crt_init (@cacert);
+  CipherVers := '';
+  CipherSuite := '';
+  Initialised := true;
+  Seeded := false;
 end;
 
 destructor TTCPSClient.Destroy;
 begin
-  mbedtls_ctr_drbg_free (@ctr_drbg);
-  mbedtls_x509_crt_free (@cacert);
-  mbedtls_ssl_config_free (@conf);
-  mbedtls_ssl_free (@ssl);
+  TidyUp;
   inherited Destroy;
 end;
 
@@ -229,9 +235,19 @@ var
   res : integer;
   flags : Longword;
   allow : boolean;
+  s : string;
 begin
   Result := false;
-  Seed;
+  if Connected then exit;
+  CipherVers := '';
+  CipherSuite := '';
+  if not Initialised then
+    begin
+      mbedtls_ssl_init (@ssl);
+      mbedtls_ssl_config_init (@conf);
+      mbedtls_x509_crt_init (@cacert);
+    end;
+  if not Seeded then Seed;
   res := mbedtls_ssl_config_defaults (@conf, MBEDTLS_SSL_IS_CLIENT,
                                       MBEDTLS_SSL_TRANSPORT_STREAM,
                                       MBEDTLS_SSL_PRESET_DEFAULT);
@@ -241,34 +257,70 @@ begin
   mbedtls_ssl_conf_rng (@conf, mbedtls_ctr_drbg_random, @ctr_drbg);
   res := mbedtls_ssl_setup (@ssl, @conf);
   if res <> 0 then exit;
-  res := mbedtls_ssl_set_hostname (@ssl, PChar (RemoteAddress));
+  if (HostName <> '') and (RemoteAddress = '') then
+    begin
+      s := ResolveHost (HostName);
+      if s <> '' then RemoteAddress := s;
+    end;
+  if RemoteAddress = '' then exit;
+  if HostName = '' then
+    res := mbedtls_ssl_set_hostname (@ssl, PChar (RemoteAddress))
+  else
+    res := mbedtls_ssl_set_hostname (@ssl, PChar (HostName));
   if res <> 0 then exit;
   mbedtls_ssl_set_bio (@ssl, Self, @NetSend, @NetRecv, nil);
-  Log ('Connecting..');
+  Log ('Connecting to ' + RemoteAddress + ' .. ');
   Result := inherited Connect;
-  Log ('Connected ' + ny[Result]);
-  if not Result then exit;
+  if not Result then
+    begin
+      Log ('Connect Error ' + Winsock2ErrorToString (WSAGetLastError));
+      exit;
+    end;
   Result := false;
-//  Log ('Setting SSL Handshake');
   res := mbedtls_ssl_handshake (@ssl);
-//  Log ('res - ' + res.ToString);
   while res <> 0 do
     begin
       if (res <> -MBEDTLS_ERR_SSL_WANT_READ) and (res <> -MBEDTLS_ERR_SSL_WANT_WRITE) then exit;
       res := mbedtls_ssl_handshake (@ssl);
-      Log ('res ! ' + res.ToString);
     end;
-//  Log ('SSL handshake ok');
+  CipherSuite := mbedtls_ssl_get_ciphersuite (@ssl);
+  CipherVers := mbedtls_ssl_get_version (@ssl);
+  if Assigned (FOnConnect) then FOnConnect (Self, CipherVers, CipherSuite);
   flags := mbedtls_ssl_get_verify_result (@ssl);
   allow := flags = 0;
   if Assigned (FOnVerify) then FOnVerify (Self, flags, allow);
   if not allow then
     begin
-      Disconnect;
+      AppClose;
       exit;
     end;
   ReadThread := TTCPSReadThread.Create (Self);  // start receive thread
+  ReadThread.OnTerminate := ReadThreadTerminated;
   Result := true;
+end;
+
+procedure TTCPSClient.TidyUp;
+begin
+//  Log ('Tidy Up');
+  CipherVers := '';
+  CipherSuite := '';
+  if Seeded then
+    begin
+      mbedtls_ctr_drbg_free (@ctr_drbg);
+      Seeded:= false
+    end;
+  if Initialised then
+    begin
+      mbedtls_x509_crt_free (@cacert);
+      mbedtls_ssl_config_free (@conf);
+      mbedtls_ssl_free (@ssl);
+      Initialised := false;
+    end;
+  if Connected then
+    begin
+      Disconnect;
+    end;
+  if Assigned (FOnDisconnect) then FOnDisconnect (Self);
 end;
 
 function TTCPSClient.Issues (code: Longword): TStringList;
@@ -300,8 +352,7 @@ begin
     begin
       if (res <> -MBEDTLS_ERR_SSL_WANT_READ) and (res <> -MBEDTLS_ERR_SSL_WANT_WRITE) then
         begin
-          res := -res;
-          Log ('ssl write failed ' + res.ToHexString (4));
+          Log ('ssl write failed ' + ErrToStr (res));
           break;
         end;
       res := mbedtls_ssl_write (@ssl, buf, len);
@@ -313,23 +364,26 @@ begin
   AppWrite (@s[1], length (s));
 end;
 
+procedure TTCPSClient.AppClose;
+begin
+  mbedtls_ssl_close_notify (@ssl);
+  TidyUp;
+end;
+
 procedure TTCPSClient.Seed;
 var
   res : integer;
 begin
-  Log ('Seeding.');
+  if Seeded then exit;
   pers := 'abcdef';
   mbedtls_ctr_drbg_init (@ctr_drbg);
   mbedtls_entropy_init (@entropy);
   mbedtls_entropy_add_source (@entropy, @RandomReadSource, nil, 0, MBEDTLS_ENTROPY_SOURCE_STRONG);
   mbedtls_entropy_add_source (@entropy, @RandomSource, nil, 0, MBEDTLS_ENTROPY_SOURCE_WEAK);
-//  log ('now seeding');
   res := mbedtls_ctr_drbg_seed (@ctr_drbg, mbedtls_entropy_func, @entropy, pers, 12);
-//  Log ('res ' + res.tostring);
-//  Log ('freeing.');
+  if res <> 0 then Log ('Seed Error ' + ErrToStr (Res));
   mbedtls_entropy_free (@entropy);
- // mbedtls_ctr_drbg_free (@ctr_drbg);
-  Log ('Seeded.');
+  Seeded := true;
 end;
 
 end.
